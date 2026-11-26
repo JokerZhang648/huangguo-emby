@@ -1,6 +1,8 @@
 /bridge.env
-/media/
-/state/
+/media/*
+!/media/.gitkeep
+/state/*
+!/state/.gitkeep
 /.venv/
 __pycache__/
 *.py[cod]
