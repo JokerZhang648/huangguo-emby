@@ -53,4 +53,4 @@ sudo docker compose exec -T bridge python bridge.py --check-upstream
 
 ## 参考
 
-[AvPlayer](https://github.com/JokerZhang648/AvPlayer) · [黄果原创](https://huangguoai.com/original/) · [黄果最近上新](https://huangguoai.com/newest) · [群晖 Container Manager 项目](https://kb.synology.com/en-global/DSM/help/ContainerManager/docker_project) · [Emby 电视节目](https://www.emby.media/support/articles/TV-Naming.html) · [Emby STRM](https://www.emby.media/support/articles/Strm-Files.html)
+ [黄果原创](https://huangguoai.com/original/) · [黄果最近上新](https://huangguoai.com/newest) · [群晖 Container Manager 项目](https://kb.synology.com/en-global/DSM/help/ContainerManager/docker_project) · [Emby 电视节目](https://www.emby.media/support/articles/TV-Naming.html) · [Emby STRM](https://www.emby.media/support/articles/Strm-Files.html)
