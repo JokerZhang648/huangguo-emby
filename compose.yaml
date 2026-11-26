@@ -1,0 +1,22 @@
+services:
+  bridge:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - bridge.env
+    environment:
+      MEDIA_DIR: /media
+      STATE_DIR: /state
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./media:/media
+      - ./state:/state
+      - ./bridge.py:/app/bridge.py:ro
+      - ./library.py:/app/library.py:ro
+      - ./source.py:/app/source.py:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/healthz', timeout=3).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
