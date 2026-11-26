@@ -14,10 +14,12 @@ from datetime import datetime, timedelta
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, urljoin, urlsplit
+from urllib.request import ProxyHandler, Request, build_opener
 
-from library import BEIJING_TIME, ID_PATTERN, Library
-from source import Huangguo, Playback, SourceError, read_bounded
+from library import BEIJING_TIME, ID_PATTERN, Library, SeriesAddition
+from source import Huangguo, Playback, ScopedRedirects, SourceError, describe_connection_failure, host_matches, read_bounded
 
 
 LOG = logging.getLogger(__name__)
@@ -25,6 +27,7 @@ PLAY_ROUTE = re.compile(rf"/play/({ID_PATTERN})/([1-9][0-9]{{0,4}})/index\.m3u8"
 ASSET_ROUTE = re.compile(r"/asset/([a-zA-Z0-9_-]{24})/([a-f0-9]{32})\.[a-z0-9]+")
 URI_ATTR = re.compile(r'(?<=[,:])URI="([^"\r\n]+)"')
 HLS_TYPE = "application/vnd.apple.mpegurl"
+DINGTALK_HOST = "oapi.dingtalk.com"
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,8 @@ class Settings:
     interval: float
     delay: float
     extra_cdn_domains: tuple[str, ...]
+    daily_at: tuple[int, int] | None
+    dingtalk_webhook: str = field(repr=False)
 
     @classmethod
     def read(cls):
@@ -66,7 +71,87 @@ class Settings:
         state = Path(os.environ.get("STATE_DIR", "state")).resolve()
         if media == state or state.is_relative_to(media):
             raise ValueError("STATE_DIR 须位于 Emby 媒体目录之外")
-        return cls(public_url, media, state, minimum, interval, delay, domains)
+        daily_text = os.environ.get("SYNC_DAILY_AT", "").strip()
+        daily_at = None
+        if daily_text:
+            if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", daily_text):
+                raise ValueError("SYNC_DAILY_AT 须使用北京时间 HH:MM 格式")
+            hour, minute = map(int, daily_text.split(":"))
+            daily_at = (hour, minute)
+        webhook = os.environ.get("DINGTALK_WEBHOOK", "").strip()
+        if webhook:
+            parsed = urlsplit(webhook)
+            tokens = parse_qs(parsed.query).get("access_token", [])
+            if (not host_matches(webhook, (DINGTALK_HOST,)) or parsed.path != "/robot/send"
+                    or parsed.fragment or len(tokens) != 1 or not re.fullmatch(r"[a-zA-Z0-9_-]+", tokens[0])):
+                raise ValueError("DINGTALK_WEBHOOK 须为包含 access_token 的钉钉机器人地址")
+        return cls(public_url, media, state, minimum, interval, delay, domains, daily_at, webhook)
+
+
+def dingtalk_messages(status: dict, additions: list[SeriesAddition], finished: datetime, scheduled: datetime) -> list[str]:
+    new = [item for item in additions if item.new_series]
+    updated = [item for item in additions if not item.new_series]
+    result = "完成" if status.get("phase") == "ready" else "结束，有失败项"
+    header = "\n".join([
+        f"黄果同步{result}",
+        f"完成时间 {finished:%Y-%m-%d %H:%M:%S}（北京时间）",
+        f"新增 {len(new)} 部，追更 {len(updated)} 部（新增 {sum(len(item.episodes) for item in updated)} 集）",
+        f"库内共 {status['series_total']} 部、{status['episodes_total']} 集",
+        f"下次运行 {scheduled:%Y-%m-%d %H:%M:%S}",
+    ])
+    lines = []
+    for item in new:
+        title = " ".join(item.title.split())[:180]
+        lines.append(f"新剧 · {title}（已收录 {len(item.episodes)} 集）")
+    for item in updated:
+        title = " ".join(item.title.split())[:180]
+        for start in range(0, len(item.episodes), 100):
+            episode_numbers = "、".join(map(str, item.episodes[start:start + 100]))
+            lines.append(f"更新 · {title} 第 {episode_numbers} 集")
+    for error in status.get("errors", []):
+        detail = " ".join(error.split())[:200]
+        lines.append(f"失败 · {detail}")
+
+    reports = []
+    message = header
+    for line in lines:
+        candidate = message + "\n" + line
+        if len(candidate.encode("utf-8")) > 12_000:
+            reports.append(message)
+            message = header + "\n" + line
+        else:
+            message = candidate
+    reports.append(message)
+    return reports
+
+
+class DingTalkNotifier:
+    def __init__(self, webhook: str):
+        self.webhook = webhook
+        self.opener = build_opener(
+            ProxyHandler({}), ScopedRedirects(lambda url: host_matches(url, (DINGTALK_HOST,)))
+        )
+
+    def send(self, messages: list[str]) -> bool:
+        for text in messages:
+            payload = json.dumps({"msgtype": "text", "text": {"content": text}}, ensure_ascii=False).encode("utf-8")
+            request = Request(self.webhook, data=payload, headers={"Content-Type": "application/json; charset=utf-8"})
+            try:
+                with self.opener.open(request, timeout=12) as response:
+                    result = json.loads(read_bounded(response, 64 * 1024, "钉钉响应"))
+            except HTTPError as exc:
+                exc.close()
+                LOG.warning("钉钉通知发送失败，HTTP %d", exc.code)
+                return False
+            except (HTTPException, OSError, SourceError, ValueError) as exc:
+                LOG.warning("钉钉通知发送失败（%s）", describe_connection_failure(exc))
+                return False
+            if not isinstance(result, dict) or result.get("errcode") != 0:
+                code = result.get("errcode") if isinstance(result, dict) else None
+                LOG.warning("钉钉通知未送达，错误码 %s", code if isinstance(code, int) else "未知")
+                return False
+        LOG.info("钉钉已发送同步摘要，共 %d 条", len(messages))
+        return True
 
 
 @dataclass(frozen=True)
@@ -311,18 +396,41 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(chunk)
 
 
-def sync_loop(library: Library, interval: float):
+def next_daily_sync(now: datetime, daily_at: tuple[int, int]) -> datetime:
+    hour, minute = daily_at
+    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return candidate + timedelta(days=1) if candidate <= now else candidate
+
+
+def sleep_until(scheduled: datetime):
+    time.sleep(max(0, (scheduled - datetime.now(BEIJING_TIME)).total_seconds()))
+
+
+def sync_loop(library: Library, interval: float, daily_at: tuple[int, int] | None = None,
+              notifier: DingTalkNotifier | None = None):
+    if daily_at is not None:
+        scheduled = next_daily_sync(datetime.now(BEIJING_TIME), daily_at)
+        library.update_status(next_sync_bjt=scheduled.isoformat(timespec="seconds"))
+        sleep_until(scheduled)
     while True:
+        snapshot = library.episode_snapshot() if notifier else None
         try:
             ok = library.sync()
         except Exception:
             LOG.exception("同步没有完成")
             library.update_status(phase="degraded", errors=["同步发生异常，请查看容器日志"])
             ok = False
-        wait_minutes = interval if ok else min(interval, 5)
-        next_sync = datetime.now(BEIJING_TIME) + timedelta(minutes=wait_minutes)
+        finished = datetime.now(BEIJING_TIME)
+        if daily_at is not None:
+            next_sync = next_daily_sync(finished, daily_at)
+        else:
+            wait_minutes = interval if ok else min(interval, 5)
+            next_sync = finished + timedelta(minutes=wait_minutes)
         library.update_status(next_sync_bjt=next_sync.isoformat(timespec="seconds"))
-        time.sleep(wait_minutes * 60)
+        if notifier is not None:
+            messages = dingtalk_messages(library.status(), library.additions_since(snapshot), finished, next_sync)
+            notifier.send(messages)
+        sleep_until(next_sync)
 
 
 def main():
@@ -330,20 +438,26 @@ def main():
     try:
         settings = Settings.read()
         source = Huangguo(settings.extra_cdn_domains)
-        library = Library(source, settings.media, settings.state, settings.minimum, settings.delay, settings.public_url)
+        library = Library(
+            source, settings.media, settings.state, settings.minimum, settings.delay, settings.public_url,
+            daily_sync=settings.daily_at is not None,
+        )
         server = BridgeServer(("0.0.0.0", 8787), source, library, settings.public_url)
+        notifier = DingTalkNotifier(settings.dingtalk_webhook) if settings.dingtalk_webhook else None
     except (ValueError, OSError, RuntimeError) as exc:
         raise SystemExit(str(exc)) from None
     if not os.environ.get("PUBLIC_BASE_URL", "").strip():
         LOG.warning("请设置 Emby 能访问的 PUBLIC_BASE_URL，当前分集入口只能在本机使用")
     catalog = Huangguo(settings.extra_cdn_domains).catalog_section()
     catalog_name = "黄果原创" if catalog == "original" else "最近上新"
-    if settings.minimum <= 0:
-        LOG.info("服务已启动，将同步%s中的全部剧目，计划每 %g 分钟扫描", catalog_name, settings.interval)
+    scope = f"{catalog_name}中的全部剧目" if settings.minimum <= 0 else f"{catalog_name}前 {settings.minimum} 部"
+    if settings.daily_at is not None:
+        hour, minute = settings.daily_at
+        LOG.info("服务已启动，将同步%s，每天北京时间 %02d:%02d 开始", scope, hour, minute)
     else:
-        LOG.info("服务已启动，同步%s前 %d 部，计划每 %g 分钟扫描", catalog_name, settings.minimum, settings.interval)
+        LOG.info("服务已启动，将同步%s，计划每 %g 分钟扫描", scope, settings.interval)
     with server:
-        threading.Thread(target=sync_loop, args=(library, settings.interval), daemon=True).start()
+        threading.Thread(target=sync_loop, args=(library, settings.interval, settings.daily_at, notifier), daemon=True).start()
         server.serve_forever()
 
 

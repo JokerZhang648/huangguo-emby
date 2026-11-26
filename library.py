@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -17,6 +18,13 @@ BEIJING_TIME = timezone(timedelta(hours=8))
 ID_PATTERN = r"[1-9][0-9]{0,15}"
 HUANGGUO_SUBDIR = os.environ.get("HUANGGUO_SUBDIR", "huangguo")
 SERIES_DIR = re.compile(rf" \[HG-{ID_PATTERN}\]$")
+
+
+@dataclass(frozen=True)
+class SeriesAddition:
+    title: str
+    new_series: bool
+    episodes: tuple[int, ...]
 
 
 def migrate_series_dirs(media_root: Path, library_dir: Path) -> None:
@@ -125,12 +133,13 @@ def episode_titles(detail: dict) -> dict[int, str]:
 
 class Library:
     def __init__(self, source: Huangguo, media_root: Path, state: Path, minimum: int, delay: float,
-                 public_url: str | None = None):
+                 public_url: str | None = None, *, daily_sync: bool = False):
         self.source = source
         self.media_root = media_root.resolve()
         self.media = self.media_root / HUANGGUO_SUBDIR
         self.minimum = minimum
         self.delay = delay
+        self.daily_sync = daily_sync
         base_url = public_url or os.environ.get("PUBLIC_BASE_URL", "").strip()
         self.public_url = (base_url or "http://127.0.0.1:8787").rstrip("/")
         migrate_series_dirs(self.media_root, self.media)
@@ -165,6 +174,21 @@ class Library:
     def update_status(self, **info):
         with self.lock:
             self.progress.update(info)
+
+    def episode_snapshot(self) -> dict[str, frozenset[int]]:
+        with self.lock:
+            return {video_id: frozenset(record["episodes"]) for video_id, record in self.records.items()}
+
+    def additions_since(self, snapshot: dict[str, frozenset[int]]) -> list[SeriesAddition]:
+        with self.lock:
+            additions = []
+            for video_id, record in self.records.items():
+                previous = snapshot.get(video_id)
+                episodes = set(record["episodes"]).difference(previous or ())
+                if episodes:
+                    title = record.get("title") or record["folder"].removesuffix(f" [HG-{video_id}]")
+                    additions.append(SeriesAddition(title, previous is None, tuple(sorted(episodes))))
+            return additions
 
     def allows_playback(self, video_id: str, number: int) -> bool:
         with self.lock:
@@ -257,6 +281,7 @@ class Library:
         )
         self._save(video_id, {
             "folder": folder.name,
+            "title": title,
             "cover": cover or record.get("cover", ""),
             "finished": finished,
             "episodes": episode_numbers,
@@ -278,6 +303,9 @@ class Library:
         if catalog_count is not None and catalog_count != known_count:
             return True
         age = now - record.get("checked_at", 0)
+        if self.daily_sync and catalog_count is not None:
+            # A changed catalog count already triggers an immediate detail refresh.
+            return age >= 7 * 86400
         if record["finished"]:
             return age >= 24 * 3600
         return age >= 6 * 3600

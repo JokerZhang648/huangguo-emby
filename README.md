@@ -33,11 +33,31 @@ sudo docker compose logs -f bridge
 
 ## 3. 维护
 
-- `HUANGGUO_CATALOG` 默认 `original`（黄果原创全部）；若改扫最近上新可设为 `newest`。`LATEST_COUNT` 默认 `0`（目录全部页）；若只需前 N 部可设为 `50` 等正整数。`SYNC_INTERVAL_MINUTES` 默认 `60`。修改 `bridge.env` 后运行 `sudo docker compose up -d --force-recreate` 应用配置。
-- 想立即跑一轮同步，可以运行 `sudo docker compose restart bridge`。同步会优先检查目录列表靠前的剧，较早入库的连载也会定期补集。保留 `media` 和 `state` 两个目录即可保留已入库文件和同步索引。
+- `HUANGGUO_CATALOG` 可选 `original`（黄果原创）或 `newest`（最近上新）。`LATEST_COUNT=0` 同步目录全部页，正整数表示取目录前 N 部。
+- 配置模板使用 `SYNC_DAILY_AT=08:00`。服务在每天北京时间 08:00 开始同步，下次运行时间见 `next_sync_bjt`。间隔运行模式使用 `SYNC_INTERVAL_MINUTES`，生效时须移除 `SYNC_DAILY_AT`。
+- 修改 `bridge.env` 后运行 `sudo docker compose up -d --no-build --pull never --force-recreate bridge` 重新加载配置。`media` 和 `state` 保存已入库文件和同步索引。
 - 如果 `/status` 显示 `degraded`，先看 `errors` 和容器日志。发生暂时性失败时会自动重试同步。
 - 如果 `8787` 已被占用，可把 `compose.yaml` 中的映射改为 `8788:8787`，以及把 `PUBLIC_BASE_URL` 的端口改为 `8788`，再重建容器。播放地址只需在局域网内可访问。
 - 如果 Emby 有封面但点播失败，先确认 Emby 机器能打开服务的 `/status`，再用容器日志区分播放接口错误和 CDN 错误。
+
+### 钉钉同步通知
+
+把自定义机器人的 Webhook 填到本地 `bridge.env` 的 `DINGTALK_WEBHOOK`，机器人安全设置的关键词填「黄果」。钉钉由 NAS 直连。每轮结束时会发摘要，列出新增剧名、已收录集数、续更集号和失败项。
+
+重建容器后，可以发一条测试消息验证配置。
+
+```sh
+sudo docker compose exec -T bridge python - <<'PY'
+import logging
+from bridge import DingTalkNotifier, Settings
+
+logging.basicConfig(level=logging.INFO)
+sent = DingTalkNotifier(Settings.read().dingtalk_webhook).send(
+    ["黄果通知测试，来自 NAS。"]
+)
+raise SystemExit(0 if sent else 1)
+PY
+```
 
 ## 4. 检查 NAS 到黄果的连接
 
@@ -47,7 +67,7 @@ sudo docker compose logs -f bridge
 sudo docker compose exec -T bridge python bridge.py --check-upstream
 ```
 
-看到「DNS 解析失败」时检查容器 DNS。出现 `ENETUNREACH` 或 `EHOSTUNREACH` 时，先用 NAS 宿主机访问同一网址，比较宿主机和容器的连通性。连接超时时，同时检查 NAS 的出口和黄果站点的响应。返回「可访问」后，可以运行 `sudo docker compose restart bridge` 立即重试同步。
+看到「DNS 解析失败」时检查容器 DNS。出现 `ENETUNREACH` 或 `EHOSTUNREACH` 时，先用 NAS 宿主机访问同一网址，比较宿主机和容器的连通性。连接超时时，同时检查 NAS 的出口和黄果站点的响应。返回「可访问」后，可在状态页查看下次同步时间。
 
 更新 Python 源文件后，可用 `sudo docker compose up -d --no-build --pull never --force-recreate bridge` 复用已有镜像并加载代码。安装或更新 Python 依赖时，使用第 1 节的构建命令。
 
